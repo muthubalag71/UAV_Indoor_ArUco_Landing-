@@ -41,3 +41,21 @@ The system was built using the following technologies:
 ---
 
 ## System Architecture (High-Level)
+- Camera publishes image stream  
+- ArUco detection computes marker pose  
+- Error is converted into velocity commands (Vx, Vy)  
+- Commands are sent via MAVROS to the flight controller  
+
+---
+
+## Requirements
+
+To run these scripts, the following must already be configured:
+
+### 1. ROS 2
+- ROS 2 Humble installed
+- Workspace properly sourced
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash
