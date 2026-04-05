@@ -28,6 +28,12 @@ class UAVBoxArUcoIntercept(Node):
         self.home_z = None
         self.home_yaw = None
 
+        # Time tracking for ArUco pose printing (every 1 second)
+        self.last_print_time = time.time()
+
+        # Last detection time for ArUco marker to handle 2-second confirmation
+        self.last_detection_time = time.time()
+
         pose_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
 
         self.state_sub = self.create_subscription(State, '/mavros/state', self.state_callback, 10)
@@ -56,7 +62,15 @@ class UAVBoxArUcoIntercept(Node):
         self.aruco_detected = msg.data
 
     def aruco_pose_callback(self, msg):
-        self.aruco_pose = msg.vector
+        self.aruco_pose = msg.vector  # Store the pose of the ArUco marker
+        current_time = time.time()
+
+        # Only print the (X, Y) position every 1 second
+        if current_time - self.last_print_time > 1.0:
+            if self.aruco_pose:
+                self.get_logger().info(f"ArUco Marker Detected at position (X: {self.aruco_pose.x}, Y: {self.aruco_pose.y})")
+                self.last_print_time = current_time  # Update the last print time
+                self.last_detection_time = current_time  # Reset detection timer
 
     def quaternion_to_yaw(self, q):
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
@@ -117,40 +131,86 @@ class UAVBoxArUcoIntercept(Node):
 
         return "EXIT"
 
-    def align_sequential(self, kp=0.4, target_tol=0.04):
-        """Sequential alignment with corrected sign based on flight test."""
+    def align_simultaneously(self, kp=0.4, target_tol=0.04):
+        """Simultaneous alignment for X and Y axes with gradual reduction to prevent deadlock."""
+        self.get_logger().info("Mission Status: Aligning X and Y simultaneously...")
 
-        # Phase 1: Forward/Backward
-        self.get_logger().info("Mission Status: Aligning X (Forward/Back)...")
+        last_known_pose = None
+        last_detection_time = time.time()
+
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.05)
 
             if self.aruco_pose:
+                # ArUco marker is detected, update last known pose and reset timer
+                last_known_pose = self.aruco_pose
+                last_detection_time = time.time()
+
+                # Calculate the error for both X and Y axes
                 error_x = self.aruco_pose.y
-
-                if abs(error_x) < target_tol:
-                    self.send_velocity(0.0, 0.0)
-                    break
-
-                vx = kp * error_x
-                vx = max(min(vx, 0.08), -0.08)
-                self.send_velocity(vx, 0.0)
-
-        # Phase 2: Left/Right
-        self.get_logger().info("Mission Status: Aligning Y (Left/Right)...")
-        while rclpy.ok():
-            rclpy.spin_once(self, timeout_sec=0.05)
-
-            if self.aruco_pose:
                 error_y = self.aruco_pose.x
 
-                if abs(error_y) < target_tol:
-                    self.send_velocity(0.0, 0.0)
+                # Check if both X and Y errors are within tolerance
+                if abs(error_x) < target_tol and abs(error_y) < target_tol:
+                    self.send_velocity(0.0, 0.0)  # Stop moving when tolerance is reached
                     break
 
+                # Calculate the velocities for both X and Y axes
+                vx = kp * error_x
                 vy = kp * error_y
+
+                # Apply velocity limits
+                vx = max(min(vx, 0.08), -0.08)
                 vy = max(min(vy, 0.08), -0.08)
-                self.send_velocity(0.0, vy)
+
+                # Apply gradual reduction in velocity as the error approaches zero (smooth transition)
+                if abs(error_x) < 0.02:  # If error is smaller than 0.02m
+                    vx *= 0.5  # Reduce velocity to prevent overshooting
+
+                if abs(error_y) < 0.02:  # If error is smaller than 0.02m
+                    vy *= 0.5  # Reduce velocity to prevent overshooting
+
+                # Send the velocities to the drone
+                self.send_velocity(vx, vy)
+
+            else:
+                # If no ArUco pose detected, use the last known pose for alignment
+                if last_known_pose is not None:
+                    error_x = last_known_pose.y
+                    error_y = last_known_pose.x
+
+                    # Continue alignment with the previous pose
+                    vx = kp * error_x
+                    vy = kp * error_y
+
+                    # Apply velocity limits
+                    vx = max(min(vx, 0.08), -0.08)
+                    vy = max(min(vy, 0.08), -0.08)
+
+                    # Apply gradual reduction in velocity as the error approaches zero (smooth transition)
+                    if abs(error_x) < 0.02:  # If error is smaller than 0.02m
+                        vx *= 0.5  # Reduce velocity to prevent overshooting
+
+                    if abs(error_y) < 0.02:  # If error is smaller than 0.02m
+                        vy *= 0.5  # Reduce velocity to prevent overshooting
+
+                    # Send the velocities to the drone
+                    self.send_velocity(vx, vy)
+
+            # Check if ArUco pose is still missing for 2 seconds, then go to the previous leg and move at slower speed
+            if time.time() - last_detection_time > 2.0:
+                self.get_logger().info("No ArUco detection for 2 seconds. Returning to previous node and resuming search...")
+                
+                # Move back to the previous node (leg 2 -> 1, for example)
+                status = self.move_to_target_world(self.home_x, self.home_y, self.home_z + 1.0, self.home_yaw)
+                
+                # Slow down and proceed with the search
+                if status == "SUCCESS":
+                    self.get_logger().info("Resuming search from previous node.")
+                    # Slow down the movement as the search resumes
+                    self.send_velocity(0.05, 0.05)  # Example slower speed for resuming search
+
+                break
 
 
 def main(args=None):
@@ -211,9 +271,9 @@ def main(args=None):
                 break
 
         if found_marker:
-            drone.get_logger().info("Mission Status: Sequential Alignment Starting (4cm Tol).")
+            drone.get_logger().info("Mission Status: Simultaneous Alignment Starting (4cm Tol).")
             time.sleep(1.0)
-            drone.align_sequential(target_tol=0.04)
+            drone.align_simultaneously(target_tol=0.04)
         else:
             drone.get_logger().info("Mission Status: Box Complete. Returning Home.")
             drone.move_to_target_world(
